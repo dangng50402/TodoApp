@@ -1,98 +1,139 @@
 import { useMemo } from 'react'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { fetchTodos, toggleTodoApi } from '@/lib/api'
+import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { fetchTodosPaginated, toggleTodoApi } from '@/lib/api'
 import type { Todo, FilterState } from '@/lib/types'
 
-// Query key dùng chung — đảm bảo invalidate đúng cache
 export const TODO_QUERY_KEY = ['todos'] as const
 
 /**
- * useTodos — custom hook tổng hợp toàn bộ logic của Todo feature:
- *   - useQuery: fetch & cache danh sách todos
- *   - useMemo:  filter + search (chỉ tính lại khi deps thay đổi)
- *   - useMutation: toggle completed với optimistic update
+ * useTodos — refactored sang useInfiniteQuery
+ *
+ * DIAGRAM luồng data:
+ *
+ *  useInfiniteQuery({ queryFn: fetchTodosPaginated, getNextPageParam })
+ *        │
+ *        ▼
+ *  data.pages = [
+ *    [todo1..10],   ← pageParam = 1
+ *    [todo11..20],  ← pageParam = 2
+ *    [todo21..30],  ← pageParam = 3
+ *  ]
+ *        │
+ *        ▼  flatMap(page => page)
+ *  allTodos = [todo1, ..., todo30]  ← flat array
+ *        │
+ *        ▼  useMemo: filter + search
+ *  filteredTodos = [...]
+ *        │
+ *        ▼  render trong App.tsx
+ *  <TodoItem /> × n  +  <div ref={observerRef} />
+ *                               │
+ *                               ▼  IntersectionObserver (trong App.tsx)
+ *                        isIntersecting && hasNextPage
+ *                               │
+ *                               ▼
+ *                        fetchNextPage() → fetch trang tiếp → data.pages thêm mảng mới
  */
 export function useTodos(filter: FilterState, searchQuery: string) {
   const queryClient = useQueryClient()
 
-  // ─── useQuery: fetch todos ────────────────────────────────────────────────
-  // staleTime: 5 phút — không refetch nếu data còn "tươi"
-  // gcTime:    10 phút — giữ cache 10 phút sau khi không còn observer
+  // ─── useInfiniteQuery: fetch todos theo trang ─────────────────────────────
   const {
-    data: todos = [],
+    data,
     isLoading,
     isError,
     error,
-  } = useQuery({
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useInfiniteQuery({
     queryKey: TODO_QUERY_KEY,
-    queryFn: fetchTodos,
+    queryFn: ({ pageParam }) => fetchTodosPaginated(pageParam as number),
+
+    // pageParam đầu tiên khi chưa có gì
+    initialPageParam: 1,
+
+    // getNextPageParam:
+    //   - lastPage = Todo[] của trang vừa xong
+    //   - allPages = tất cả pages đã có
+    //   - lastPage.length < 10 → trang cuối → return undefined → hasNextPage = false
+    //   - lastPage.length === 10 → còn trang → return số trang tiếp theo
+    getNextPageParam: (lastPage, allPages) =>
+      lastPage.length === 10 ? allPages.length + 1 : undefined,
+
     staleTime: 5 * 60 * 1000,
     gcTime: 10 * 60 * 1000,
   })
 
-  // ─── useMemo: filter + search ─────────────────────────────────────────────
-  // Chỉ tính lại khi todos, filter, hoặc searchQuery thay đổi.
-  // Tránh re-filter toàn bộ 200 todos mỗi lần render không liên quan.
-  const filteredTodos = useMemo(() => {
-    let result = todos
+  // ─── Flatten pages → 1 mảng phẳng ────────────────────────────────────────
+  // data.pages = [[...], [...], [...]]
+  // flatMap(page => page) = [..., ..., ...]
+  const allTodos: Todo[] = useMemo(
+    () => data?.pages.flatMap(page => page) ?? [],
+    [data]
+  )
 
-    // Lọc theo trạng thái
+  // ─── useMemo: filter + search ─────────────────────────────────────────────
+  // Chạy trên allTodos (đã flat) — giữ nguyên logic cũ
+  const filteredTodos = useMemo(() => {
+    let result = allTodos
+
     if (filter === 'completed')  result = result.filter(t => t.completed)
     if (filter === 'incomplete') result = result.filter(t => !t.completed)
 
-    // Tìm kiếm theo title (case-insensitive)
     const q = searchQuery.trim().toLowerCase()
     if (q) result = result.filter(t => t.title.toLowerCase().includes(q))
 
     return result
-  }, [todos, filter, searchQuery])
+  }, [allTodos, filter, searchQuery])
 
   // ─── useMutation: toggle completed với optimistic update ─────────────────
+  // Logic giữ nguyên — chỉ cần cập nhật cách setQueryData vì
+  // data bây giờ là InfiniteData<Todo[]> thay vì Todo[]
   const toggleMutation = useMutation({
     mutationFn: ({ id, completed }: { id: number; completed: boolean }) =>
       toggleTodoApi(id, completed),
 
-    // onMutate chạy TRƯỚC khi API call — đây là trái tim của optimistic update
     onMutate: async ({ id, completed }) => {
-      // 1. Cancel mọi query đang pending cho key này
-      //    → tránh server response overwrite optimistic update của ta
       await queryClient.cancelQueries({ queryKey: TODO_QUERY_KEY })
 
-      // 2. Lưu snapshot state hiện tại để rollback nếu lỗi
-      const previousTodos = queryClient.getQueryData<Todo[]>(TODO_QUERY_KEY)
+      // Snapshot InfiniteData (có shape { pages, pageParams })
+      const previousData = queryClient.getQueryData(TODO_QUERY_KEY)
 
-      // 3. Cập nhật cache ngay lập tức (optimistic)
-      //    User thấy kết quả ngay, không cần chờ server
-      queryClient.setQueryData<Todo[]>(TODO_QUERY_KEY, old =>
-        old?.map(t => t.id === id ? { ...t, completed } : t) ?? []
+      // Cập nhật optimistic: duyệt qua từng page, map từng todo
+      queryClient.setQueryData<{ pages: Todo[][]; pageParams: unknown[] }>(
+        TODO_QUERY_KEY,
+        old => {
+          if (!old) return old
+          return {
+            ...old,
+            pages: old.pages.map(page =>
+              page.map(t => t.id === id ? { ...t, completed } : t)
+            ),
+          }
+        }
       )
-      //    ?? [] có thể gây bug nếu old undefined
 
-      // 4. Trả về context để onError có thể rollback
-      return { previousTodos }
+      return { previousData }
     },
 
-    // onError: nếu API thất bại → rollback về snapshot
     onError: (_err, _vars, context) => {
-      if (context?.previousTodos) {
-        queryClient.setQueryData(TODO_QUERY_KEY, context.previousTodos)
+      if (context?.previousData) {
+        queryClient.setQueryData(TODO_QUERY_KEY, context.previousData)
       }
     },
 
-    // onSettled: luôn chạy (dù thành công hay thất bại)
-    // → invalidate để refetch data thật từ server, đảm bảo đồng bộ
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: TODO_QUERY_KEY })
     },
   })
-    // có thể dùng onSuccess?
 
-  // Stats để hiển thị
+  // Stats — tính trên allTodos (toàn bộ đã load, không chỉ trang hiện tại)
   const stats = useMemo(() => ({
-    total: todos.length,
-    completed: todos.filter(t => t.completed).length,
+    total: allTodos.length,
+    completed: allTodos.filter(t => t.completed).length,
     filtered: filteredTodos.length,
-  }), [todos, filteredTodos])
+  }), [allTodos, filteredTodos])
 
   return {
     filteredTodos,
@@ -100,6 +141,10 @@ export function useTodos(filter: FilterState, searchQuery: string) {
     isError,
     error,
     stats,
+    // infinite scroll controls — trả ra để App.tsx dùng
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
     toggleTodo: (todo: Todo) =>
       toggleMutation.mutate({ id: todo.id, completed: !todo.completed }),
     pendingIds: new Set(
