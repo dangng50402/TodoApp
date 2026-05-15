@@ -1,51 +1,77 @@
-import { useState, useMemo } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useDebounce } from '@/hooks/useDebounce'
 import { useTodos } from '@/hooks/useTodos'
 import { TodoItem } from '@/components/TodoItem'
 import { FilterBar } from '@/components/FilterBar'
 import { SearchInput } from '@/components/SearchInput'
 import { SkeletonList } from '@/components/SkeletonList'
-import { Pagination } from '@/components/Pagination'
+// Pagination đã bỏ — thay bằng infinite scroll
 import type { FilterState } from '@/lib/types'
-
-const PAGE_SIZE = 15
 
 export default function App() {
   // ── UI state ──────────────────────────────────────────────────────────────
   const [filter, setFilter] = useState<FilterState>('all')
   const [searchInput, setSearchInput] = useState('')
-  const [currentPage, setCurrentPage] = useState(1)
 
-  // useDebounce: searchInput thay đổi ngay khi gõ,
-  // nhưng searchQuery chỉ cập nhật sau 300ms ngừng gõ
-  // → useMemo trong useTodos sẽ chỉ re-compute sau khi ngừng gõ
+  // currentPage đã bỏ — không còn dùng pagination
   const searchQuery = useDebounce(searchInput, 300)
 
-  // Reset về trang 1 khi filter hoặc search thay đổi
-  const handleFilterChange = (f: FilterState) => {
-    setFilter(f)
-    setCurrentPage(1)
-  }
-  const handleSearchChange = (v: string) => {
-    setSearchInput(v)
-    setCurrentPage(1)
-  }
+  const handleFilterChange = (f: FilterState) => setFilter(f)
+  const handleSearchChange = (v: string) => setSearchInput(v)
 
-  // ── Data layer (custom hook bọc useQuery + useMemo + useMutation) ─────────
-  const { filteredTodos, isLoading, isError, error, stats, toggleTodo, pendingIds } =
-    useTodos(filter, searchQuery)
+  // ── Data layer ────────────────────────────────────────────────────────────
+  const {
+    filteredTodos,
+    isLoading,
+    isError,
+    error,
+    stats,
+    toggleTodo,
+    pendingIds,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useTodos(filter, searchQuery)
 
-  // ── Pagination (useMemo: chỉ tính lại khi filteredTodos / currentPage đổi)
-  const { pagedTodos, totalPages } = useMemo(() => {
-    const totalPages = Math.ceil(filteredTodos.length / PAGE_SIZE)
-    const safeCurrentPage = Math.min(currentPage, Math.max(1, totalPages))
-    const start = (safeCurrentPage - 1) * PAGE_SIZE
-    return {
-      pagedTodos: filteredTodos.slice(start, start + PAGE_SIZE),
-      totalPages,
-    }
-  }, [filteredTodos, currentPage])
+  // ── IntersectionObserver — watch sentinel div ở cuối list ─────────────────
+  //
+  // Tại sao không dùng useEffect + scroll event?
+  //   - scroll event bắn 60fps+ → cần throttle thủ công, dễ sai, tốn CPU
+  //   - Phải tự tính scrollTop + clientHeight + scrollHeight → fragile trên mobile
+  //   - Không hoạt động đúng khi list nằm trong scroll container lồng nhau
+  //   - IntersectionObserver: browser tự handle, chạy off main thread,
+  //     không block UI, không cần cleanup phức tạp
+  const observerRef = useRef<HTMLDivElement>(null)
 
+  useEffect(() => {
+    const sentinel = observerRef.current
+    if (!sentinel) return
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        // Chỉ fetch khi:
+        //   1. sentinel vào viewport
+        //   2. còn trang tiếp (hasNextPage = true)
+        //   3. không đang fetch dở (tránh gọi double)
+        if (entry.isIntersecting && hasNextPage && !isFetchingNextPage) {
+          fetchNextPage()
+        }
+      },
+      {
+        // Bắt đầu fetch trước khi người dùng chạm đáy 100px
+        // → UX mượt hơn, không bị "chờ" khi cuộn nhanh
+        rootMargin: '0px 0px 100px 0px',
+        threshold: 0,
+      }
+    )
+
+    observer.observe(sentinel)
+
+    // cleanup: disconnect khi deps thay đổi hoặc component unmount
+    return () => observer.disconnect()
+  }, [hasNextPage, isFetchingNextPage, fetchNextPage])
+
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="max-w-2xl mx-auto px-5 py-8">
       {/* Header */}
@@ -59,7 +85,7 @@ export default function App() {
           </p>
         </div>
 
-        {/* Stats */}
+        {/* Stats — tính trên allTodos đã load, không chỉ page hiện tại */}
         {!isLoading && !isError && (
           <div
             className="text-right text-xs font-mono leading-relaxed"
@@ -73,6 +99,10 @@ export default function App() {
               {stats.completed}
             </span>
             /{stats.total} done
+            {/* Chỉ hiện khi còn trang — biến mất khi load xong toàn bộ */}
+            {hasNextPage && (
+              <span style={{ color: 'var(--muted)' }}> · còn nữa…</span>
+            )}
           </div>
         )}
       </div>
@@ -97,13 +127,13 @@ export default function App() {
         </div>
       )}
 
-      {/* Loading skeleton */}
+      {/* Loading skeleton — chỉ cho lần fetch đầu tiên (isLoading) */}
       {isLoading && <SkeletonList count={12} />}
 
       {/* Todo list */}
       {!isLoading && !isError && (
-        <>
-          {pagedTodos.length === 0 ? (
+        <div className="flex flex-col gap-1.5">
+          {filteredTodos.length === 0 && !isFetchingNextPage ? (
             <div
               className="text-center py-16 text-sm"
               style={{ color: 'var(--muted)' }}
@@ -111,26 +141,46 @@ export default function App() {
               {searchQuery ? 'Không tìm thấy kết quả.' : 'Không có todo nào.'}
             </div>
           ) : (
-            <div className="flex flex-col gap-1.5">
-              {pagedTodos.map(todo => (
-                <TodoItem
-                  key={todo.id}
-                  todo={todo}
-                  searchQuery={searchQuery}
-                  isPending={pendingIds.has(todo.id)}
-                  onToggle={toggleTodo}
-                />
-              ))}
-            </div>
+            filteredTodos.map(todo => (
+              <TodoItem
+                key={todo.id}
+                todo={todo}
+                searchQuery={searchQuery}
+                isPending={pendingIds.has(todo.id)}
+                onToggle={toggleTodo}
+              />
+            ))
           )}
 
-          <Pagination
-            currentPage={currentPage}
-            totalPages={totalPages}
-            onPageChange={setCurrentPage}
-          />
-        </>
+          {/*
+           * Skeleton khi đang fetch thêm trang (isFetchingNextPage).
+           * KHÁC với isLoading (lần đầu):
+           *   isLoading         = true  → chưa có data gì → SkeletonList toàn trang (trên)
+           *   isFetchingNextPage = true → đang load thêm → skeleton nhỏ ở cuối list
+           */}
+          {isFetchingNextPage && <SkeletonList count={4} />}
+
+          {/*
+           * Sentinel — IntersectionObserver quan sát div này.
+           * Khi div vào viewport → callback → fetchNextPage().
+           * Luôn render (kể cả khi !hasNextPage) để observer có DOM node,
+           * nhưng guard hasNextPage bên trong callback sẽ không fetch nữa.
+           */}
+          <div ref={observerRef} style={{ height: 1 }} aria-hidden />
+
+          {/* Ẩn hoàn toàn khi còn trang — chỉ hiện khi đã load hết */}
+          {!hasNextPage && filteredTodos.length > 0 && (
+            <p
+              className="text-center text-xs py-4 font-mono"
+              style={{ color: 'var(--muted)' }}
+            >
+              ✓ Đã hiển thị tất cả {stats.total} todos
+            </p>
+          )}
+        </div>
       )}
+
+      {/* Pagination đã bỏ — replaced by infinite scroll */}
     </div>
   )
 }
